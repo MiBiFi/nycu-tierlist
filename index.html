@@ -325,7 +325,7 @@ select option { background: #221f1f; }
     <span class="h1-cold">拉完了</span>
   </h1>
   <p>NYCU 實驗室 Tier List<br>需要用學校 Google 帳號登入才能參與</p>
-  <div class="domain-badge">@nycu.edu.tw　或　@nctu.edu.tw</div>
+  <div class="domain-badge">@nycu.edu.tw　或　@g2.nctu.edu.tw</div>
   <button class="btn-google" id="btnLogin">
     <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
       <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4"/>
@@ -546,15 +546,26 @@ function showAuthGate() {
   authGate.style.display = 'flex';
 }
 
+// ── DATA HELPERS (Firestore doesn't support nested arrays) ──
+function docToTiers(data) {
+  if (!data) return [[], [], [], [], []];
+  return [0,1,2,3,4].map(i => data['tier' + i] || []);
+}
+function tiersToDoc(tiers) {
+  const doc = {};
+  tiers.forEach((arr, i) => { doc['tier' + i] = arr; });
+  return doc;
+}
+
 // ════════════════════════════════════════════════
 // REAL-TIME DATA
 // ════════════════════════════════════════════════
 function subscribeData() {
   // Tier list
   unsubTiers = tiersDoc().onSnapshot(snap => {
-    const data = snap.data() || { tiers: [[],[],[],[],[]] };
-    renderTiers(data.tiers);
-    populateSelects(data.tiers);
+    const tiers = docToTiers(snap.data());
+    renderTiers(tiers);
+    populateSelects(tiers);
   });
 
   // Log (latest 50)
@@ -590,9 +601,9 @@ function chipHtml(lab, ti, tiers) {
       ${escHtml(lab)}
       <div class="chip-actions">
         <button class="chip-btn up" ${canUp?'':'disabled'}
-          onclick="quickMove('${escAttr(lab)}', -1, ${JSON.stringify(tiers).replace(/"/g,'&quot;')})" title="上移">▲</button>
+          onclick="quickMove('${escAttr(lab)}', -1)" title="上移">▲</button>
         <button class="chip-btn dn" ${canDown?'':'disabled'}
-          onclick="quickMove('${escAttr(lab)}', 1, ${JSON.stringify(tiers).replace(/"/g,'&quot;')})" title="下移">▼</button>
+          onclick="quickMove('${escAttr(lab)}', 1)" title="下移">▼</button>
       </div>
     </div>`;
 }
@@ -665,19 +676,15 @@ async function doAdd() {
   const ti   = parseInt($('addTier').value);
   if (!name) { toast('請輸入 lab 名稱', 'err'); $('btnSubmit').disabled=false; return; }
 
-  // Transaction: check duplicate + append
   await db.runTransaction(async tx => {
     const snap = await tx.get(tiersDoc());
-    const data = snap.exists ? snap.data() : { tiers: [[],[],[],[],[]] };
-    const tiers = data.tiers || [[],[],[],[],[]];
+    const tiers = docToTiers(snap.data());
 
     const allLabs = tiers.flat().map(l => l.toLowerCase());
     if (allLabs.includes(name.toLowerCase())) throw new Error('這個 lab 已經在表上了！');
 
-    tiers[ti] = [...(tiers[ti] || []), name];
-    tx.set(tiersDoc(), { tiers });
-
-    // Mark user
+    tiers[ti] = [...tiers[ti], name];
+    tx.set(tiersDoc(), tiersToDoc(tiers));
     tx.set(usersCol().doc(currentUser.uid), { acted: true, email: currentUser.email, ts: firebase.firestore.FieldValue.serverTimestamp() });
   });
 
@@ -694,10 +701,10 @@ async function doMove() {
   const dir     = $('moveDir').value;
   if (!labName) { toast('請選擇要移動的 lab', 'err'); $('btnSubmit').disabled=false; return; }
 
+  let logDesc = '';
   await db.runTransaction(async tx => {
     const snap = await tx.get(tiersDoc());
-    const data = snap.exists ? snap.data() : { tiers: [[],[],[],[],[]] };
-    const tiers = data.tiers || [[],[],[],[],[]];
+    const tiers = docToTiers(snap.data());
 
     let fromTi = -1;
     tiers.forEach((t,i) => { if (t.includes(labName)) fromTi = i; });
@@ -709,50 +716,27 @@ async function doMove() {
 
     tiers[fromTi] = tiers[fromTi].filter(l => l !== labName);
     tiers[toTi]   = [...tiers[toTi], labName];
-    tx.set(tiersDoc(), { tiers });
-
+    tx.set(tiersDoc(), tiersToDoc(tiers));
     tx.set(usersCol().doc(currentUser.uid), { acted: true, email: currentUser.email, ts: firebase.firestore.FieldValue.serverTimestamp() });
-
-    // stash for log (can't await inside tx after write)
-    tx._logDesc = `將「${labName}」從【${TIER_NAMES[fromTi]}】${toTi < fromTi ? '上移' : '下移'}到【${TIER_NAMES[toTi]}】`;
-    tx._toTi    = toTi;
-    tx._fromTi  = fromTi;
+    logDesc = `將「${labName}」${toTi < fromTi ? '上移' : '下移'}到【${TIER_NAMES[toTi]}】`;
   });
 
-  const toTi = dir === 'up'
-    ? (()=>{ let f=-1; return f; })()  // re-derive below
-    : 0;
-
-  // Re-derive toTi for toast (simpler)
-  const snap2  = await tiersDoc().get();
-  const tiers2 = snap2.data()?.tiers || [];
-  let newTi = -1;
-  tiers2.forEach((t,i) => { if (t.includes(labName)) newTi = i; });
-
-  await writeLog(`將「${labName}」移動到【${newTi >= 0 ? TIER_NAMES[newTi] : '?'}】`);
-
+  await writeLog(logDesc);
   hasActed = true;
   renderActionState();
   toast(`✅ 移動成功！`, 'ok');
 }
 
 // Quick move from chip buttons — also costs the user's one action
-async function quickMove(lab, delta, tiersSnapshot) {
+async function quickMove(lab, delta) {
   if (hasActed) { toast('你已經操作過了！', 'err'); return; }
   if (!currentUser) { toast('請先登入', 'err'); return; }
 
-  // find current tier from snapshot passed in
-  let fromTi = -1;
-  tiersSnapshot.forEach((t, i) => { if (t.includes(lab)) fromTi = i; });
-  if (fromTi < 0) return;
-  const toTi = fromTi + delta;
-  if (toTi < 0 || toTi >= TIER_NAMES.length) return;
-
   try {
+    let logDesc = '';
     await db.runTransaction(async tx => {
       const snap = await tx.get(tiersDoc());
-      const data = snap.exists ? snap.data() : { tiers: [[],[],[],[],[]] };
-      const tiers = data.tiers;
+      const tiers = docToTiers(snap.data());
 
       let ft = -1;
       tiers.forEach((t,i) => { if (t.includes(lab)) ft = i; });
@@ -763,11 +747,12 @@ async function quickMove(lab, delta, tiersSnapshot) {
 
       tiers[ft] = tiers[ft].filter(l => l !== lab);
       tiers[tt] = [...tiers[tt], lab];
-      tx.set(tiersDoc(), { tiers });
+      tx.set(tiersDoc(), tiersToDoc(tiers));
       tx.set(usersCol().doc(currentUser.uid), { acted: true, email: currentUser.email, ts: firebase.firestore.FieldValue.serverTimestamp() });
+      logDesc = `將「${lab}」${delta < 0 ? '上移' : '下移'}到【${TIER_NAMES[tt]}】`;
     });
 
-    await writeLog(`將「${lab}」${delta < 0 ? '上移' : '下移'}一格`);
+    await writeLog(logDesc);
     hasActed = true;
     renderActionState();
     toast(`✅ 已移動「${lab}」`, 'ok');
